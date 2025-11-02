@@ -5,57 +5,125 @@ on:
     branches: [ "main" ]
 
 jobs:
-  deploy:
+  # 1️⃣ Build: 원격 서버에 배포 폴더를 준비하고 권한을 설정합니다.
+  build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Prepare remote directory
         run: |
-          echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
-          chmod 600 key.pem
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} '
+            set -euxo pipefail
+            
+            # 원격 서버의 현재 유저 이름($USER)을 가져옵니다.
+            REMOTE_USER=$(id -un)
+            
+            # 프로젝트 폴더를 생성합니다. (-p 옵션으로 상위 폴더도 자동 생성)
+            sudo mkdir -p /srv/demo/projects/${{ secrets.APP_NAME }}
+            
+            # 생성한 폴더의 소유권을 현재 유저에게 부여합니다.
+            sudo chown -R $REMOTE_USER:$REMOTE_USER /srv/demo
+            
+            echo "✅ Directory /srv/demo/projects/${{ secrets.APP_NAME }} is ready."
+          '
 
-      - name: Deploy to EC2
+  # 2️⃣ Sync: GitHub의 최신 코드를 원격 서버로 동기화(복사)합니다.
+  sync:
+    runs-on: ubuntu-latest
+    needs: build # build 작업이 성공해야 실행됩니다.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Rsync project files to EC2
         run: |
-          ssh -o StrictHostKeyChecking=no -i key.pem \
-            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} <<'EOSSH'
-          set -euxo pipefail
-          APP="${APP_NAME:-${{ secrets.APP_NAME }}}"
-          HOST_PORT="${HOST_PORT:-${{ secrets.HOST_PORT }}}"
-          CONTAINER_PORT="${CONTAINER_PORT:-${{ secrets.CONTAINER_PORT }}}"
-          [ -z "$CONTAINER_PORT" ] && CONTAINER_PORT=3000
-          WORKDIR="/srv/demo/projects/$APP"
-          CONTAINER="app_${APP}"
+          rsync -az --delete \
+            -e "ssh -o StrictHostKeyChecking=no" ./ \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/srv/demo/projects/${{ secrets.APP_NAME }}/
 
-          echo "---- [front] Deploy $APP ----"
-          cd "$WORKDIR"
+  # 3️⃣ Deploy: 동기화된 최신 코드로 Docker 이미지를 빌드하고 컨테이너를 실행합니다.
+  deploy:
+    runs-on: ubuntu-latest
+    needs: sync # sync 작업이 성공해야 실행됩니다.
+    steps:
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
 
-          sudo docker ps -q --filter "publish=${HOST_PORT}" | xargs -r sudo docker rm -f || true
-          sudo docker rm -f "$CONTAINER" 2>/dev/null || true
+      - name: Remote build, run, and health check
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} <<'EOSSH'
+            set -euxo pipefail
+            
+            # GitHub Secrets로부터 변수를 가져옵니다.
+            APP="${{ secrets.APP_NAME }}"
+            HOST_PORT="${{ secrets.HOST_PORT }}"
+            # CONTAINER_PORT가 없으면 기본값으로 3000을 사용합니다.
+            CONTAINER_PORT="${{ secrets.CONTAINER_PORT:-3000}}"
+            WORKDIR="/srv/demo/projects/$APP"
+            CONTAINER_NAME="app_${APP}"
 
-          sudo docker build -t "${APP}:latest" .
-          sudo docker network create demo_net 2>/dev/null || true
+            echo "---- [front] Deploying $APP to $HOST_PORT:$CONTAINER_PORT ----"
+            cd "$WORKDIR"
 
-          sudo docker run -d --name "$CONTAINER" \
-            --network demo_net \
-            -p "${HOST_PORT}:${CONTAINER_PORT}" \
-            --cpus="0.5" --memory="512m" --pids-limit=256 \
-            --restart unless-stopped \
-            -e PORT="${CONTAINER_PORT}" \
-            "${APP}:latest"
-
-          echo "🩺 Health check..."
-          for i in {1..30}; do
-            if curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null 2>&1 || \
-               curl -fsS "http://127.0.0.1:${HOST_PORT}/" >/dev/null 2>&1; then
-              echo "✅ OK"
-              exit 0
+            # 0️⃣ 기존에 동일한 포트를 사용하던 컨테이너가 있다면 모두 종료 및 제거
+            if sudo docker ps -q --filter "publish=${HOST_PORT}" | grep -q .; then
+              echo "Stopping container(s) using port ${HOST_PORT}..."
+              sudo docker ps -q --filter "publish=${HOST_PORT}" | xargs sudo docker rm -f
             fi
-            sleep 1
-          done
-          echo "❌ Health check failed"
-          sudo docker logs --tail 100 "$CONTAINER" || true
-          exit 1
+
+            # 1️⃣ 이전 버전의 앱 컨테이너가 있다면 종료 및 제거
+            if sudo docker ps -a -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
+              echo "Removing old container ${CONTAINER_NAME}..."
+              sudo docker rm -f "$CONTAINER_NAME"
+            fi
+            
+            # 2️⃣ 최신 코드로 Docker 이미지 빌드
+            echo "Building Docker image ${APP}:latest..."
+            sudo docker build -t "${APP}:latest" .
+
+            # 3️⃣ Docker 네트워크 생성 (이미 있으면 통과)
+            sudo docker network create demo_net || true
+
+            # 4️⃣ 새 컨테이너 실행
+            echo "Running new container ${CONTAINER_NAME}..."
+            sudo docker run -d --name "$CONTAINER_NAME" \
+              --network demo_net \
+              -p "${HOST_PORT}:${CONTAINER_PORT}" \
+              --cpus="0.5" --memory="512m" --pids-limit=256 \
+              --restart unless-stopped \
+              -e PORT="${CONTAINER_PORT}" \
+              "${APP}:latest"
+
+            # 5️⃣ 헬스 체크
+            echo "🩺 Health checking..."
+            for i in {1..30}; do
+              # /healthz 또는 / 경로로 접속을 시도하여 성공하면 배포 성공으로 간주
+              if curl -fsS "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null 2>&1 || \
+                 curl -fsS "http://127.0.0.1:${HOST_PORT}/" >/dev/null 2>&1; then
+                echo "✅ Health check successful!"
+                exit 0
+              fi
+              echo "Waiting for container to be healthy... ($i/30)"
+              sleep 1
+            done
+            
+            # 30초 안에 헬스 체크 실패 시
+            echo "❌ Health check failed after 30 seconds."
+            echo "Displaying container logs:"
+            sudo docker logs --tail 100 "$CONTAINER_NAME" || true
+            exit 1
           EOSSH
