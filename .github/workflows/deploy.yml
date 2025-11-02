@@ -71,8 +71,9 @@ jobs:
             # GitHub Secrets로부터 변수를 가져옵니다.
             APP="${{ secrets.APP_NAME }}"
             HOST_PORT="${{ secrets.HOST_PORT }}"
-            # CONTAINER_PORT가 없으면 기본값으로 3000을 사용합니다.
-            CONTAINER_PORT="${{ secrets.CONTAINER_PORT:-3000}}"
+            # ❗❗❗ [수정된 부분] ❗❗❗
+            # secrets.CONTAINER_PORT 값이 없으면 셸이 기본값으로 3000을 사용합니다.
+            CONTAINER_PORT="${{ secrets.CONTAINER_PORT }:-3000}"
             WORKDIR="/srv/demo/projects/$APP"
             CONTAINER_NAME="app_${APP}"
 
