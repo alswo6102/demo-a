@@ -7,55 +7,70 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      # 1️⃣ 코드 체크아웃
+      # 1) 코드 체크아웃
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2️⃣ SSH 키 세팅
+      # 2) SSH 키 세팅
       - name: Setup SSH key
         run: |
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-      # 3️⃣ 프로젝트 폴더를 EC2로 동기화
-      - name: Rsync project to EC2
+      # 3) 대상 디렉터리 사전 생성 (원격에서 sudo)
+      - name: Prepare target dir on EC2 (sudo)
         run: |
-          rsync -az --delete -e "ssh -i key.pem -o StrictHostKeyChecking=no" ./ \
+          ssh -i key.pem -o StrictHostKeyChecking=no \
+            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
+            "sudo mkdir -p /srv/demo/projects/${{ secrets.APP_NAME }}/"
+
+      # 4) 프로젝트 동기화 (원격에서 rsync를 sudo로 실행)
+      - name: Rsync project to EC2 (sudo on remote)
+        run: |
+          rsync -az --delete \
+            --rsync-path="sudo rsync" \
+            -e "ssh -i key.pem -o StrictHostKeyChecking=no" ./ \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/srv/demo/projects/${{ secrets.APP_NAME }}/
 
-      # 4️⃣ EC2 내부에서 빌드 및 컨테이너 재기동
+      # 5) 원격에서 빌드 및 컨테이너 재기동
       - name: Remote build and run
         run: |
-          ssh -i key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          ssh -i key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
             set -e
-            APP=${{ secrets.APP_NAME }}
-            HOST_PORT=${{ secrets.HOST_PORT }}
-            CONTAINER_PORT=${{ secrets.CONTAINER_PORT || 8080 }}
-            WORKDIR=/srv/demo/projects/$APP
 
-            echo "🔧 Working dir: $WORKDIR"
-            cd "$WORKDIR"
+            APP='${{ secrets.APP_NAME }}'
+            HOST_PORT='${{ secrets.HOST_PORT }}'
+            CONTAINER_PORT='${{ secrets.CONTAINER_PORT }}'
+            [ -z "\$CONTAINER_PORT" ] && CONTAINER_PORT=8080
+            WORKDIR=/srv/demo/projects/\$APP
+
+            echo "🔧 Working dir: \$WORKDIR"
+            cd "\$WORKDIR"
 
             # (1) 이전 컨테이너 정리
-            docker rm -f app_${APP} 2>/dev/null || true
+            docker rm -f app_\$APP 2>/dev/null || true
 
             # (2) 새 이미지 빌드
-            docker build -t ${APP}:latest .
+            docker build -t \$APP:latest .
 
-            # (3) 새 컨테이너 실행
-            docker run -d --name app_${APP} \
+            # (3) 네트워크 준비
+            docker network create demo_net 2>/dev/null || true
+
+            # (4) 새 컨테이너 실행
+            docker run -d --name app_\$APP \
               --network demo_net \
-              -p ${HOST_PORT}:${CONTAINER_PORT} \
+              -p \$HOST_PORT:\$CONTAINER_PORT \
               --cpus="0.5" --memory="512m" --pids-limit=256 \
               --restart unless-stopped \
-              -e PORT=${CONTAINER_PORT} \
-              ${APP}:latest
+              -e PORT=\$CONTAINER_PORT \
+              \$APP:latest
 
-            # (4) 간단 헬스 체크
+            # (5) 간단 헬스 체크 (/ 로 체크)
             echo "🩺 Checking health..."
             for i in {1..20}; do
-              if curl -fsS http://127.0.0.1:${HOST_PORT}/health >/dev/null; then
+              if curl -fsS "http://127.0.0.1:\$HOST_PORT/" >/dev/null; then
                 echo "✅ Health OK"
                 exit 0
               fi
@@ -63,6 +78,6 @@ jobs:
             done
 
             echo "❌ Health check failed"
-            docker logs --tail=200 app_${APP} || true
+            docker logs --tail=200 app_\$APP || true
             exit 1
           EOF
