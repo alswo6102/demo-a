@@ -27,7 +27,7 @@ app.listen(port, () => {
       target: "http://demo_api:8000",
       changeOrigin: false,
       xfwd: true,
-      pathRewrite: { "^/api": "/api" },
+      pathRewrite: { "^/api": "" },
       proxyTimeout: 5000,
       onError(err, req, res) {
         console.error("Proxy error:", err); // 터미널에 에러 로그 출력
