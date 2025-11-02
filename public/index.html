@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>demo-a Frontend (Vanilla JS)</title>
+  <style>body{font-family:system-ui;margin:2rem}button{padding:.6rem 1rem;margin-right:.6rem}pre{background:#f5f7fa;padding:1rem;border-radius:.5rem;white-space:pre-wrap}</style>
+</head>
+<body>
+  <h1>demo-a (Frontend, Vanilla JS)</h1>
+  <p>/api/* 요청은 내부 네트워크의 <code>demo_api:8000</code> (Django)로 프록시됩니다.</p>
+
+  <button id="ping">GET /api/ping</button>
+  <button id="echo">POST /api/echo</button>
+  <pre id="out">-</pre>
+
+  <script>
+    const out = document.getElementById('out');
+    document.getElementById('ping').onclick = async () => {
+      out.textContent = 'loading...';
+      const r = await fetch('/api/ping');
+      out.textContent = JSON.stringify(await r.json(), null, 2);
+    };
+    document.getElementById('echo').onclick = async () => {
+      out.textContent = 'loading...';
+      const r = await fetch('/api/echo', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ from:'demo-a frontend', t:Date.now() })
+      });
+      out.textContent = JSON.stringify(await r.json(), null, 2);
+    };
+  </script>
+</body>
+</html>
