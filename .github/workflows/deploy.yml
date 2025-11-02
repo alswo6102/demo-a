@@ -46,7 +46,7 @@ jobs:
             -e "ssh -o StrictHostKeyChecking=no" ./ \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/srv/demo/projects/${{ secrets.APP_NAME }}/
 
-# 3️⃣ Deploy: 동기화된 코드로 Docker 컨테이너를 실행합니다.
+  # 3️⃣ Deploy: 동기화된 코드로 Docker 컨테이너를 실행합니다. (❗완전히 재작성된 부분❗)
   deploy:
     runs-on: ubuntu-latest
     needs: sync
@@ -56,53 +56,74 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
 
-      - name: Forensic Diagnosis of Docker Image
+      - name: Remote Build, Run, and Health Check
+        # ❗ [핵심] env 키워드로 변수를 먼저 명확하게 정의합니다.
         env:
           REMOTE_HOST: ${{ secrets.EC2_HOST }}
           REMOTE_USER: ${{ secrets.EC2_USER }}
           APP: ${{ secrets.APP_NAME }}
+          HOST_PORT: ${{ secrets.HOST_PORT }}
+          CONTAINER_PORT: ${{ secrets.CONTAINER_PORT }} # 기본값은 스크립트 내부에서 처리
         
         run: |
+          # ❗ [핵심] 정의된 env 변수들을 원격 서버로 넘겨 스크립트를 실행합니다.
+          # 이 구조는 변수 충돌이 절대 발생하지 않습니다.
           ssh -o StrictHostKeyChecking=no $REMOTE_USER@$REMOTE_HOST "
+            # 변수를 원격 셸 환경에 설정
             export APP='$APP'
-            
+            export HOST_PORT='$HOST_PORT'
+            export CONTAINER_PORT='$CONTAINER_PORT'
+
+            # 아래 스크립트 실행
             bash -s" << 'EOF'
               set -euxo pipefail
               
+              # 셸 문법으로 CONTAINER_PORT가 비어있으면 기본값 3000을 사용
+              EFFECTIVE_CONTAINER_PORT=${CONTAINER_PORT:-3000}
+              
               WORKDIR="/srv/demo/projects/$APP"
-              IMAGE_NAME="diagnostic-image"
+              CONTAINER_NAME="app_$APP"
 
-              echo "---- Forensic Diagnosis Started ----"
+              echo "---- [front] Deploying $APP to $HOST_PORT:$EFFECTIVE_CONTAINER_PORT ----"
               cd "$WORKDIR"
+
+              # 기존 컨테이너 정리
+              if sudo docker ps -q --filter "publish=$HOST_PORT" | grep -q .; then
+                echo "Stopping container(s) using port $HOST_PORT..."
+                sudo docker ps -q --filter "publish=$HOST_PORT" | xargs sudo docker rm -f
+              fi
+              if sudo docker ps -a -q --filter "name=$CONTAINER_NAME" | grep -q .; then
+                echo "Removing old container $CONTAINER_NAME..."
+                sudo docker rm -f "$CONTAINER_NAME"
+              fi
               
-              # 1. 서버에 있는 Dockerfile 내용을 다시 한번 확인합니다.
-              echo "--- Step 1: Verifying Dockerfile content on server ---"
-              cat Dockerfile
-              echo "------------------------------------------------------"
-
-              # 2. 이미지를 빌드합니다.
-              echo "--- Step 2: Building the diagnostic image ---"
-              sudo docker build -t $IMAGE_NAME .
-              echo "---------------------------------------------"
-
-              # 3. Docker가 이 이미지의 CMD를 무엇으로 인식하는지 확인합니다.
-              echo "--- Step 3: Inspecting CMD recorded in the built image ---"
-              sudo docker inspect $IMAGE_NAME | grep -C 3 '"Cmd":'
-              echo "------------------------------------------------------------"
-
-              # 4. 이미지 안에 직접 들어가서 파일을 확인하고, 수동으로 서버를 실행해봅니다.
-              echo "--- Step 4: Manually running server inside the container ---"
-              # || true 를 붙여서 내부에서 에러가 나도 워크플로우가 멈추지 않게 합니다.
-              sudo docker run --rm --network demo_net $IMAGE_NAME sh -c ' \
-                echo "--- Files in container root ---"; \
-                ls -la; \
-                echo "--- Node version ---"; \
-                node -v; \
-                echo "--- Trying to start server.mjs manually ---"; \
-                node server.mjs; \
-              ' || true
+              # 빌드 및 실행
+              echo "Building Docker image $APP:latest..."
+              sudo docker build -t "$APP:latest" .
+              sudo docker network create demo_net || true
               
-              echo "---- Forensic Diagnosis Finished ----"
-              # 이 워크플로우는 의도적으로 실패해야 하므로, 마지막에 에러 코드를 반환합니다.
+              echo "Running new container $CONTAINER_NAME..."
+              sudo docker run -d --name "$CONTAINER_NAME" \
+                --network demo_net \
+                -p "$HOST_PORT:$EFFECTIVE_CONTAINER_PORT" \
+                --cpus="0.5" --memory="512m" --pids-limit=256 \
+                --restart unless-stopped \
+                -e PORT="$EFFECTIVE_CONTAINER_PORT" \
+                "$APP:latest"
+
+              # 헬스 체크
+              echo "🩺 Health checking..."
+              for i in {1..30}; do
+                if curl -fsS "http://127.0.0.1:$HOST_PORT/healthz" >/dev/null 2>&1 || \
+                   curl -fsS "http://127.0.0.1:$HOST_PORT/" >/dev/null 2>&1; then
+                  echo "✅ Health check successful!"
+                  exit 0
+                fi
+                echo "Waiting for container to be healthy... ($i/30)"
+                sleep 1
+              done
+              
+              echo "❌ Health check failed after 30 seconds."
+              sudo docker logs --tail 100 "$CONTAINER_NAME" || true
               exit 1
           EOF
