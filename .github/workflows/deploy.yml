@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
 
 jobs:
-  # 1) Build: 연결/키 준비만 (빠름)
+  # 1) Build: 연결/키 준비 + /srv/demo 디렉토리/소유권 확정 (모두 sudo)
   build:
     runs-on: ubuntu-latest
     steps:
@@ -17,18 +17,20 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-      - name: Verify SSH & prepare base dir ownership (once and for all)
+      - name: Prepare /srv/demo (create+own via sudo, idempotent)
         run: |
-          # /srv/demo 를 네 사용자 소유로 고정해 두면 rsync에 sudo가 필요 없어집니다.
           ssh -o StrictHostKeyChecking=no -i key.pem \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
             'set -euxo pipefail; \
-             sudo mkdir -p /srv/demo/projects && \
-             sudo chown -R $USER:$USER /srv/demo && \
-             mkdir -p /srv/demo/projects/${{ secrets.APP_NAME }} && \
-             echo "✅ ownership fixed: $(id -un) owns /srv/demo"'
+             # 1) 루트 권한으로 경로 전부 생성
+             sudo mkdir -p /srv/demo/projects/${{ secrets.APP_NAME }}; \
+             # 2) demo 트리 전체를 현재 사용자에게 소유권 이전
+             sudo chown -R $USER:$USER /srv/demo; \
+             # 3) 접근권한 보정
+             sudo find /srv/demo -type d -exec chmod 755 {} +; \
+             echo "✅ /srv/demo ready and owned by $(id -un)"'
 
-  # 2) Sync: sudo 없이 rsync (root 소유 문제의 근본 원인 제거)
+  # 2) Sync: sudo 없이 rsync (root 소유 문제 근본 제거)
   sync:
     runs-on: ubuntu-latest
     needs: build
@@ -41,7 +43,7 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-      - name: Rsync project to EC2 (no sudo needed)
+      - name: Rsync project to EC2 (no sudo)
         run: |
           rsync -az --delete \
             -e "ssh -i key.pem -o StrictHostKeyChecking=no" ./ \
@@ -52,11 +54,11 @@ jobs:
           ssh -o StrictHostKeyChecking=no -i key.pem \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
             'set -eux; \
-             ls -ld /srv/demo /srv/demo/projects /srv/demo/projects/${{ secrets.APP_NAME }}; \
-             # 혹시라도 루트가 섞였으면 한번 더 정리
-             find /srv/demo/projects/${{ secrets.APP_NAME }} -maxdepth 1 -mindepth 0 -exec bash -lc "sudo chown -R $USER:$USER {}" \;'
+             ls -ld /srv /srv/demo /srv/demo/projects /srv/demo/projects/${{ secrets.APP_NAME }}; \
+             # 혹시라도 루트가 섞였으면 한 번 더 정리
+             sudo chown -R $USER:$USER /srv/demo/projects/${{ secrets.APP_NAME }} || true'
 
-  # 3) Deploy: 도커 빌드/실행 (docker는 sudo로 실행해 권한 이슈 원천 차단)
+  # 3) Deploy: 도커 빌드/실행 (안전하게 sudo docker 사용)
   deploy:
     runs-on: ubuntu-latest
     needs: sync
@@ -81,9 +83,10 @@ jobs:
               echo "🔧 Working dir: $WORKDIR"
               cd "$WORKDIR"
 
-              # (0) docker 사용 권한 방어적 조치 (로그인 세션 갱신 필요하므로 여기선 sudo docker 사용 유지)
-              if ! groups | grep -q '\bdocker\b'; then
-                sudo usermod -aG docker "$USER" || true
+              # (0) docker 권한은 나중에 정리하더라도, 지금은 sudo docker로 안전 실행
+              if ! command -v docker >/dev/null 2>&1; then
+                sudo apt-get update -y
+                sudo apt-get install -y docker.io
               fi
 
               # (1) 이전 컨테이너 정리
@@ -104,7 +107,7 @@ jobs:
                 -e PORT=${CONTAINER_PORT} \
                 ${APP}:latest
 
-              # (5) 헬스 체크 (루프/슬립으로 안정화 대기)
+              # (5) 헬스 체크
               echo "🩺 Checking health..."
               for i in {1..30}; do
                 if curl -fsS "http://127.0.0.1:${HOST_PORT}/" >/dev/null; then
