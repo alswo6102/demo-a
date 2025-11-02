@@ -18,4 +18,4 @@ COPY . .
 EXPOSE 3000
 
 # 6. 애플리케이션 실행
-CMD [ "node", "server.mjs" ] # 또는 CMD ["npm", "start"] 등 프로젝트에 맞는 명령
+CMD [ "node", "server.mjs" ]
