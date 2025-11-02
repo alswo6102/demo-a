@@ -5,13 +5,9 @@ on:
     branches: [ "main" ]
 
 jobs:
-  # 1️⃣ Build 단계 (공통 준비)
+  # 1) Build: 연결/키 준비만 (빠름)
   build:
     runs-on: ubuntu-latest
-    outputs:
-      EC2_HOST: ${{ secrets.EC2_HOST }}
-      EC2_USER: ${{ secrets.EC2_USER }}
-      APP_NAME: ${{ secrets.APP_NAME }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,13 +17,18 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-      - name: Verify connection
+      - name: Verify SSH & prepare base dir ownership (once and for all)
         run: |
+          # /srv/demo 를 네 사용자 소유로 고정해 두면 rsync에 sudo가 필요 없어집니다.
           ssh -o StrictHostKeyChecking=no -i key.pem \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
-            "echo '✅ EC2 SSH connection OK'"
+            'set -euxo pipefail; \
+             sudo mkdir -p /srv/demo/projects && \
+             sudo chown -R $USER:$USER /srv/demo && \
+             mkdir -p /srv/demo/projects/${{ secrets.APP_NAME }} && \
+             echo "✅ ownership fixed: $(id -un) owns /srv/demo"'
 
-  # 2️⃣ Sync 단계 (build 성공 후)
+  # 2) Sync: sudo 없이 rsync (root 소유 문제의 근본 원인 제거)
   sync:
     runs-on: ubuntu-latest
     needs: build
@@ -40,27 +41,22 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-      - name: Prepare target dir on EC2 (sudo)
-        run: |
-          ssh -i key.pem -o StrictHostKeyChecking=no \
-            ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
-            "sudo mkdir -p /srv/demo/projects/${{ secrets.APP_NAME }}/"
-
-      - name: Rsync project to EC2 (sudo on remote)
+      - name: Rsync project to EC2 (no sudo needed)
         run: |
           rsync -az --delete \
-            --rsync-path="sudo rsync" \
             -e "ssh -i key.pem -o StrictHostKeyChecking=no" ./ \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/srv/demo/projects/${{ secrets.APP_NAME }}/
 
-      - name: Fix ownership after rsync
+      - name: Sanity check perms (defensive)
         run: |
-          ssh -i key.pem -o StrictHostKeyChecking=no \
+          ssh -o StrictHostKeyChecking=no -i key.pem \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
-            "sudo chown -R \$(id -un):\$(id -gn) /srv/demo/projects/${{ secrets.APP_NAME }} && \
-             sudo find /srv/demo/projects/${{ secrets.APP_NAME }} -type d -exec chmod 755 {} +"
+            'set -eux; \
+             ls -ld /srv/demo /srv/demo/projects /srv/demo/projects/${{ secrets.APP_NAME }}; \
+             # 혹시라도 루트가 섞였으면 한번 더 정리
+             find /srv/demo/projects/${{ secrets.APP_NAME }} -maxdepth 1 -mindepth 0 -exec bash -lc "sudo chown -R $USER:$USER {}" \;'
 
-  # 3️⃣ Deploy 단계 (sync 성공 후)
+  # 3) Deploy: 도커 빌드/실행 (docker는 sudo로 실행해 권한 이슈 원천 차단)
   deploy:
     runs-on: ubuntu-latest
     needs: sync
@@ -70,11 +66,11 @@ jobs:
           echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
           chmod 600 key.pem
 
-      - name: Remote build and run
+      - name: Remote build and run (sudo docker)
         run: |
-          ssh -tt -i key.pem -o StrictHostKeyChecking=no \
+          ssh -o StrictHostKeyChecking=no -i key.pem \
             ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-              set -e
+              set -euxo pipefail
 
               APP='${{ secrets.APP_NAME }}'
               HOST_PORT='${{ secrets.HOST_PORT }}'
@@ -85,17 +81,22 @@ jobs:
               echo "🔧 Working dir: $WORKDIR"
               cd "$WORKDIR"
 
+              # (0) docker 사용 권한 방어적 조치 (로그인 세션 갱신 필요하므로 여기선 sudo docker 사용 유지)
+              if ! groups | grep -q '\bdocker\b'; then
+                sudo usermod -aG docker "$USER" || true
+              fi
+
               # (1) 이전 컨테이너 정리
-              docker rm -f app_${APP} 2>/dev/null || true
+              sudo docker rm -f app_${APP} 2>/dev/null || true
 
               # (2) 새 이미지 빌드
-              docker build -t ${APP}:latest .
+              sudo docker build -t ${APP}:latest .
 
               # (3) 네트워크 준비
-              docker network create demo_net 2>/dev/null || true
+              sudo docker network create demo_net 2>/dev/null || true
 
               # (4) 새 컨테이너 실행
-              docker run -d --name app_${APP} \
+              sudo docker run -d --name app_${APP} \
                 --network demo_net \
                 -p ${HOST_PORT}:${CONTAINER_PORT} \
                 --cpus="0.5" --memory="512m" --pids-limit=256 \
@@ -103,9 +104,9 @@ jobs:
                 -e PORT=${CONTAINER_PORT} \
                 ${APP}:latest
 
-              # (5) 헬스체크
+              # (5) 헬스 체크 (루프/슬립으로 안정화 대기)
               echo "🩺 Checking health..."
-              for i in {1..20}; do
+              for i in {1..30}; do
                 if curl -fsS "http://127.0.0.1:${HOST_PORT}/" >/dev/null; then
                   echo "✅ Health OK"
                   exit 0
@@ -113,7 +114,7 @@ jobs:
                 sleep 1
               done
 
-              echo "❌ Health check failed"
-              docker logs --tail=200 app_${APP} || true
+              echo "❌ Health check failed, showing logs"
+              sudo docker logs --tail=200 app_${APP} || true
               exit 1
             EOF
