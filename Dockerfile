@@ -4,8 +4,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
-RUN npm run build   # 결과물이 /app/dist 라고 가정 (Vite/CRA 등)
-
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 # --- run stage (Nginx) ---
 FROM nginx:alpine
 # 빌드 산출물 배포
