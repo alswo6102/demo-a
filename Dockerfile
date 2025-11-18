@@ -6,8 +6,6 @@ RUN apk add --no-cache curl
 
 # 컨테이너 내부 리슨 포트
 ENV PORT=3000
-# 백엔드 서비스(default)
-ENV API_TARGET=http://backend:8000
 
 # Nginx 설정 복사 (이미 repo에 nginx.conf 있음)
 COPY nginx.conf /etc/nginx/conf.d/default.conf
